@@ -11,8 +11,8 @@
 public static class UblUnits
 {
     /// <summary>
-    /// Unit spelling to the code SEF accepts. **Every code here is on SEF's list of twenty-five**
-    /// — see `SefUnitCatalogue`, read from the authority on 2026-08-28.
+    /// Unit spelling to the code SEF accepts. **Every code here is on SEF's list of twenty-five**,
+    /// read from the authority on 2026-08-28.
     ///
     /// `cm` and `pak` used to be here, mapped to CMT and XPK. Both are valid UN/ECE Recommendation
     /// 20 codes and neither has ever been on SEF's list, so a line in either unit was refused by

@@ -31,8 +31,9 @@ public static class SefInvoiceUblWriter
     /// UN/CEFACT 1001 document type codes, as the Serbian CIUS uses them.
     ///
     /// **A konačni račun is a 380 like any other invoice.** What makes it final is the prepayment
-    /// it deducts, not a code of its own — the deduction is expressed in
-    /// <c>cac:PrepaidPayment</c> and the advances are named in <c>cac:BillingReference</c>.
+    /// it deducts, not a code of its own — the deduction is the <c>cbc:PrepaidAmount</c> in
+    /// <c>cac:LegalMonetaryTotal</c>, which the payable amount falls by, and the advances are
+    /// named in <c>cac:BillingReference</c>.
     /// </summary>
     private const string InvoiceTypeCode = "380";
     private const string CreditNoteTypeCode = "381";
@@ -76,10 +77,16 @@ public static class SefInvoiceUblWriter
         // A debit note is an *Invoice* document with type code 383. UBL has no DebitNote root:
         // the thing a knjižno zaduženje does is charge more, which is what an invoice does, and
         // the code is what says it corrects an earlier one rather than declaring a new supply.
-        document.Add(
-            new XElement(Cbc + (isCreditNote ? "CreditNoteTypeCode" : "InvoiceTypeCode"),
-                TypeCodeFor(invoice.Type)),
-            new XElement(Cbc + "DocumentCurrencyCode", invoice.CurrencyCode));
+        document.Add(new XElement(
+            Cbc + (isCreditNote ? "CreditNoteTypeCode" : "InvoiceTypeCode"),
+            TypeCodeFor(invoice.Type)));
+
+        // Directly after the type code in both schemas, ahead of the currency codes: a Note
+        // written further down is out of sequence and the document fails schema validation.
+        if (!string.IsNullOrWhiteSpace(invoice.Note))
+            document.Add(new XElement(Cbc + "Note", invoice.Note));
+
+        document.Add(new XElement(Cbc + "DocumentCurrencyCode", invoice.CurrencyCode));
 
         // The currency the tax is accounted in. Stated only when the document is not already in
         // it: emitting it on a domestic invoice would be redundant at best and, on a CIUS that
@@ -87,9 +94,6 @@ public static class SefInvoiceUblWriter
         // about a conversion that never happened.
         if (IsForeignCurrency(invoice, options))
             document.Add(new XElement(Cbc + "TaxCurrencyCode", options.TaxCurrencyCode));
-
-        if (!string.IsNullOrWhiteSpace(invoice.Note))
-            document.Add(new XElement(Cbc + "Note", invoice.Note));
 
         // Datum prometa. Carried as an invoice period rather than a single date because that is
         // how the Serbian CIUS expresses the supply date on a document that has no line-level
@@ -133,16 +137,19 @@ public static class SefInvoiceUblWriter
                     new XElement(Cbc + "ID", invoice.BankAccount))));
         }
 
-        document.Add(TaxTotal(invoice));
-
         // The tax-currency half, on a foreign-currency invoice only. Both elements are omitted
         // entirely on a domestic one: there is no conversion to declare, and declaring one would
         // assert an exchange that never took place.
+        //
+        // The rate comes BEFORE the first TaxTotal in both schemas, while the second TaxTotal
+        // follows the first; written the other way round the document is out of sequence.
         if (invoice.Conversion is { } conversion)
-        {
-            document.Add(TaxTotalInTaxCurrency(conversion, options));
             document.Add(TaxExchangeRate(invoice, conversion, options));
-        }
+
+        document.Add(TaxTotal(invoice));
+
+        if (invoice.Conversion is { } taxCurrencyConversion)
+            document.Add(TaxTotalInTaxCurrency(taxCurrencyConversion, options));
 
         document.Add(MonetaryTotal(invoice));
 
@@ -150,27 +157,20 @@ public static class SefInvoiceUblWriter
         foreach (var line in invoice.Lines)
             document.Add(Line(line, lineNumber++, invoice.CurrencyCode, isCreditNote));
 
-        return SefResult<string>.Ok(
-            new XDocument(new XDeclaration("1.0", "UTF-8", null), document).ToString());
+        var xml = new XDocument(new XDeclaration("1.0", "UTF-8", null), document);
+
+        // XDocument.ToString() drops the declaration, so it is written out here.
+        return SefResult<string>.Ok(xml.Declaration + Environment.NewLine + xml);
     }
 
-    /// <summary>
-    /// Everything wrong with the document, checked before a single element is written.
-    ///
-    /// These are not schema checks — SEF does those, and does them better. They are the mistakes
-    /// whose cost is a document the tax authority accepts and records differently from what the
-    /// customer was charged: totals that do not match the lines they are made of, a quantity in a
-    /// unit nobody coded, an exemption claimed on no stated basis.
-    /// </summary>
     /// <summary>
     /// UN/CEFACT 1001, per kind.
     ///
     /// **Written from the published CIUS rather than from a sandbox exchange.** The codes and the
     /// prepayment shape are UBL 2.1 and the Serbian CIUS as documented; what a sandbox settles is
     /// whether *this host's* documents pass validation, and that is a verification step rather
-    /// than a design question. Until one has run, `SefUblGoldenTests` is what pins the shape, so
-    /// the first sandbox rejection shows as a diff against a known document rather than as a
-    /// mystery.
+    /// than a design question. Until one has run, the writer tests are what pin the shape, so the
+    /// first sandbox rejection shows as a diff against a known document rather than as a mystery.
     /// </summary>
     private static string TypeCodeFor(SefInvoiceType type) => type switch
     {
@@ -182,6 +182,14 @@ public static class SefInvoiceUblWriter
         _ => InvoiceTypeCode
     };
 
+    /// <summary>
+    /// Everything wrong with the document, checked before a single element is written.
+    ///
+    /// These are not schema checks — SEF does those, and does them better. They are the mistakes
+    /// whose cost is a document the tax authority accepts and records differently from what the
+    /// customer was charged: totals that do not match the lines they are made of, a quantity in a
+    /// unit nobody coded, an exemption claimed on no stated basis.
+    /// </summary>
     private static List<string> Check(SefInvoice invoice, SefUblOptions options)
     {
         var problems = new List<string>();
@@ -190,9 +198,10 @@ public static class SefInvoiceUblWriter
         // needed was never effort — it was the UBL shape, and that comes from the published CIUS:
         // a knjižno zaduženje is an Invoice with type code 383 referencing the document it
         // corrects, an avansni račun is a 386, and a konačni račun is an ordinary 380 whose
-        // prepayment is expressed as `cac:PrepaidPayment` against `cac:BillingReference` entries
-        // naming the advances. The sandbox settles whether *these* documents validate, which is a
-        // verification step; `SefUblGoldenTests` pins the shape until it runs.
+        // prepayment is expressed as `cbc:PrepaidAmount` in `cac:LegalMonetaryTotal`, beside
+        // `cac:BillingReference` entries naming the advances. The sandbox settles whether *these*
+        // documents validate, which is a verification step; the writer tests pin the shape until
+        // it runs.
         //
         // What is checked here is what SEF would accept and record wrongly:
 
@@ -249,14 +258,6 @@ public static class SefInvoiceUblWriter
         // stornoed.
         if (string.IsNullOrWhiteSpace(invoice.Number))
             problems.Add("Dokument bez broja ne može biti prijavljen na SEF.");
-
-        // A credit note that names no original is a correction the authority cannot match to
-        // anything: it reduces "some invoice", which is not a statement a tax inspector accepts.
-        if (invoice.Type == SefInvoiceType.CreditNote
-            && string.IsNullOrWhiteSpace(invoice.CorrectsInvoiceNumber))
-        {
-            problems.Add("Knjižno odobrenje mora da navede broj fakture koju ispravlja.");
-        }
 
         if (invoice.Type != SefInvoiceType.CreditNote && invoice.DueDate is null)
             problems.Add("Faktura mora imati rok plaćanja.");

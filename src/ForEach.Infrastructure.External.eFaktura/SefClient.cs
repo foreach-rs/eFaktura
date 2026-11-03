@@ -48,7 +48,8 @@ public sealed class SefClient(HttpClient httpClient, SefCredentials credentials)
     /// </summary>
     private static SefResult<TTo> Carry<TFrom, TTo>(SefResult<TFrom> result) =>
         result.Outcome == SefOutcome.Unknown
-            ? SefResult<TTo>.Unknown(result.FailureMessage)
+            ? SefResult<TTo>.Unknown(
+                result.FailureMessage, result.HttpStatusCode, result.ResponseBody)
             : result.Error is { } error
                 ? SefResult<TTo>.Fail(error, result.ResponseBody)
                 : SefResult<TTo>.Transport(result.FailureMessage);
@@ -269,22 +270,25 @@ public sealed class SefClient(HttpClient httpClient, SefCredentials credentials)
     // ---- Plumbing -------------------------------------------------------------------------
 
     /// <summary>A read. Nothing it does can leave the tax authority in a state we cannot see.</summary>
-    private Task<SefResult<string>> GetAsync(string path, CancellationToken ct)
+    private async Task<SefResult<string>> GetAsync(string path, CancellationToken ct)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, path);
 
-        return ExchangeAsync(request, changesState: false, ct);
+        // Awaited rather than returned: `using` disposes the request when this method exits, and a
+        // returned task has not sent anything yet — the send would find a disposed request.
+        return await ExchangeAsync(request, changesState: false, ct);
     }
 
     /// <summary>
     /// Every posted payload in this API changes something — accepting a purchase invoice,
     /// cancelling a sale, recording VAT. Declared as such once here rather than at each caller.
     /// </summary>
-    private Task<SefResult<string>> PostJsonAsync(string path, object payload, CancellationToken ct)
+    private async Task<SefResult<string>> PostJsonAsync(string path, object payload, CancellationToken ct)
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, path) { Content = JsonBody(payload) };
 
-        return ExchangeAsync(request, changesState: true, ct);
+        // Awaited for the same reason as in GetAsync: the body is disposed with the request.
+        return await ExchangeAsync(request, changesState: true, ct);
     }
 
     private static StringContent JsonBody(object payload)
@@ -313,7 +317,8 @@ public sealed class SefClient(HttpClient httpClient, SefCredentials credentials)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, path);
 
-        Prepare(request);
+        if (!TryPrepare(request, out var problem))
+            return SefResult<byte[]>.Fail(SefError.Local(problem, []));
 
         try
         {
@@ -332,7 +337,14 @@ public sealed class SefClient(HttpClient httpClient, SefCredentials credentials)
 
             return SefResult<byte[]>.Ok(await response.Content.ReadAsByteArrayAsync(timeout.Token));
         }
-        catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
+        // OperationCanceledException rather than only TaskCanceledException, and only when the
+        // caller did not ask for it: a timeout while the body is being read throws the base type,
+        // and the caller's own cancellation has to reach them as an exception.
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return SefResult<byte[]>.Transport($"SEF did not answer within {Timeout.TotalSeconds:0} s.");
+        }
+        catch (HttpRequestException exception)
         {
             return SefResult<byte[]>.Transport(exception.Message);
         }
@@ -356,7 +368,8 @@ public sealed class SefClient(HttpClient httpClient, SefCredentials credentials)
     private async Task<SefResult<string>> ExchangeAsync(
         HttpRequestMessage request, bool changesState, CancellationToken ct)
     {
-        Prepare(request);
+        if (!TryPrepare(request, out var problem))
+            return SefResult<string>.Fail(SefError.Local(problem, []));
 
         try
         {
@@ -376,12 +389,19 @@ public sealed class SefClient(HttpClient httpClient, SefCredentials credentials)
             // a storno applied before it failed is indistinguishable from one that never ran. On a
             // read the same status is simply a failure worth retrying.
             if (changesState && (int)response.StatusCode >= 500)
-                return SefResult<string>.Unknown($"SEF returned {(int)response.StatusCode}.");
+            {
+                return SefResult<string>.Unknown(
+                    $"SEF returned {(int)response.StatusCode}.", (int)response.StatusCode, body);
+            }
 
             return SefResult<string>.Fail(
                 SefErrorReader.Read((int)response.StatusCode, body), body);
         }
-        catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+        // OperationCanceledException rather than only TaskCanceledException: SendAsync throws the
+        // latter on a timeout, but a timeout while the body is still being read throws the base
+        // type, and a submission whose reply was cut off is exactly the case that must come back
+        // as Unknown rather than as an exception.
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             var message = $"SEF did not answer within {Timeout.TotalSeconds:0} s.";
 
@@ -391,22 +411,50 @@ public sealed class SefClient(HttpClient httpClient, SefCredentials credentials)
         }
         catch (HttpRequestException exception)
         {
-            // A connection cut mid-send is the same question as a timeout: it may have arrived.
-            return changesState
+            // A connection that never opened changed nothing, whatever the request was for: the
+            // name did not resolve, the port refused, the TLS handshake failed. Nothing was sent,
+            // so nothing can be filed, and the right answer is a retryable failure — an Unknown
+            // here would forbid the resend and leave the host reconciling an invoice SEF never
+            // received. A connection cut after it opened is the other case: SEF may have read the
+            // request, and on a send that is Unknown, the same question as a timeout.
+            return changesState && !NeverConnected(exception)
                 ? SefResult<string>.Unknown(exception.Message)
                 : SefResult<string>.Transport(exception.Message);
         }
     }
 
+    private static bool NeverConnected(HttpRequestException exception) =>
+        exception.HttpRequestError is HttpRequestError.NameResolutionError
+            or HttpRequestError.ConnectionError
+            or HttpRequestError.SecureConnectionError;
+
     private TimeSpan Timeout =>
         TimeSpan.FromSeconds(Math.Clamp(credentials.TimeoutSeconds, 1, 600));
 
-    private void Prepare(HttpRequestMessage request)
+    /// <summary>
+    /// Builds the address and sets the headers. A base URL that is not a URL, or a key that is not
+    /// a legal header value, is a settings mistake: it comes back as a failure the host can show,
+    /// not as an exception out of a client whose other failures are all results.
+    /// </summary>
+    private bool TryPrepare(HttpRequestMessage request, out string problem)
     {
-        request.RequestUri = credentials.Endpoint(request.RequestUri!.ToString());
+        try
+        {
+            request.RequestUri = credentials.Endpoint(request.RequestUri!.ToString());
 
-        request.Headers.Add("ApiKey", credentials.ApiKey);
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("*/*"));
+            request.Headers.Add("ApiKey", credentials.ApiKey);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("*/*"));
+
+            problem = "";
+
+            return true;
+        }
+        catch (Exception exception) when (exception is UriFormatException or FormatException)
+        {
+            problem = $"SEF address or key is not usable: {exception.Message}";
+
+            return false;
+        }
     }
 
     private async Task<SefResult<IReadOnlyList<SefStatusChange>>> ChangesAsync(
@@ -421,12 +469,12 @@ public sealed class SefClient(HttpClient httpClient, SefCredentials credentials)
     }
 
     /// <summary>Changes is a POST despite reading data — that is how the API defines it.</summary>
-    private Task<SefResult<string>> GetChangesBodyAsync(string path, CancellationToken ct)
+    private async Task<SefResult<string>> GetChangesBodyAsync(string path, CancellationToken ct)
     {
         using var request = new HttpRequestMessage(HttpMethod.Post, path) { Content = Empty() };
 
         // A POST that reads: the method is the API's choice, and a timeout here changes nothing.
-        return ExchangeAsync(request, changesState: false, ct);
+        return await ExchangeAsync(request, changesState: false, ct);
     }
 
     /// <summary>
@@ -458,8 +506,4 @@ public sealed class SefClient(HttpClient httpClient, SefCredentials credentials)
 
     private static string Iso(DateTime value) =>
         value.ToString("yyyy-MM-ddTHH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
-
-    private static string EnsureTrailingSlash(string url) => url.EndsWith('/') ? url : url + "/";
-
-    private static string Summarise(string body) => body.Length <= 300 ? body : body[..300] + "…";
 }

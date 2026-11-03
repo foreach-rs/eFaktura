@@ -59,10 +59,12 @@ public static class SefInvoiceUblReader
             Text(root.Element(Cbc + "ID")),
             Date(root.Element(Cbc + "IssueDate")),
 
-            // The payment terms rather than a field of its own: UBL puts the due date inside
-            // PaymentMeans, and a reader looking for a DueDate element finds nothing on every
-            // conformant invoice ever sent.
-            Date(root.Element(Cac + "PaymentMeans")?.Element(Cbc + "PaymentDueDate")),
+            // UBL 2.1 puts the due date on the Invoice itself, as cbc:DueDate — that is where the
+            // Serbian CIUS and this library's own writer put it. PaymentMeans/PaymentDueDate is
+            // the older place and some suppliers still use it, so it is the fallback; a credit
+            // note has neither.
+            Date(root.Element(Cbc + "DueDate"))
+            ?? Date(root.Element(Cac + "PaymentMeans")?.Element(Cbc + "PaymentDueDate")),
             PartyName(supplier),
             CompanyId(supplier, "VA"),
             CompanyId(supplier, null),

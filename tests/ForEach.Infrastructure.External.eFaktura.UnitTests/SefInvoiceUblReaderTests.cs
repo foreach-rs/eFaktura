@@ -1,4 +1,5 @@
 using ForEach.Infrastructure.External.eFaktura.Purchase;
+using ForEach.Infrastructure.External.eFaktura.Ubl;
 
 namespace ForEach.Infrastructure.External.eFaktura.UnitTests;
 
@@ -41,14 +42,46 @@ public class SefInvoiceUblReaderTests
     }
 
     [Fact]
-    public void The_due_date_is_read_from_the_payment_terms_where_UBL_puts_it()
+    public void The_due_date_falls_back_to_the_payment_means_where_older_suppliers_put_it()
     {
-        // There is no DueDate element in UBL. A reader looking for one finds nothing on every
-        // conformant invoice ever sent, and the ageing then treats each of them as due today.
+        // cbc:DueDate on the Invoice is where UBL 2.1 puts it (see the next test); some suppliers
+        // still use PaymentMeans/PaymentDueDate. A reader that knew only one of the two would show
+        // no due date on half of what arrives, and the ageing would treat each as due today.
         var withoutTerms = SefInvoiceUblReader.Read(Invoice(paymentMeans: false));
 
         Assert.Null(withoutTerms.DueDate);
         Assert.Equal(new DateOnly(2026, 9, 19), SefInvoiceUblReader.Read(Invoice()).DueDate);
+    }
+
+    [Fact]
+    public void The_due_date_on_the_invoice_itself_wins_over_the_payment_means()
+    {
+        var xml = Invoice().Replace(
+            "<cbc:IssueDate>2026-08-20</cbc:IssueDate>",
+            "<cbc:IssueDate>2026-08-20</cbc:IssueDate><cbc:DueDate>2026-10-01</cbc:DueDate>",
+            StringComparison.Ordinal);
+
+        Assert.Equal(new DateOnly(2026, 10, 1), SefInvoiceUblReader.Read(xml).DueDate);
+    }
+
+    [Fact]
+    public void A_due_date_the_writer_wrote_is_read_back()
+    {
+        var seller = new SefParty("HRC d.o.o.", "111111111", "20000001", "Industrijska 5", "Beograd", "11000", "RS");
+        var buyer = new SefParty("Kafić Zvezda", "100000001", "20000002", "Knez Mihailova 1", "Beograd", "11000", "RS");
+
+        var invoice = new SefInvoice(
+            "0002/2026", SefInvoiceType.Invoice,
+            new DateOnly(2026, 7, 29), new DateOnly(2026, 8, 28), new DateOnly(2026, 7, 28),
+            "RSD", seller, buyer,
+            [new SefInvoiceLine("Kesica šećera", "kom", 1000m, 2.50m, 0m,
+                SefVatCategory.Standard, 20m, null, 2500m, 500m)],
+            2500m, 500m, 3000m);
+
+        var written = SefInvoiceUblWriter.Write(invoice, new SefUblOptions("urn:test"));
+
+        Assert.True(written.IsSuccess, written.FailureMessage);
+        Assert.Equal(new DateOnly(2026, 8, 28), SefInvoiceUblReader.Read(written.Value!).DueDate);
     }
 
     [Fact]

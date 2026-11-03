@@ -68,7 +68,9 @@ public sealed record SefError(
 
         // UBL that does not validate, or an action the invoice's status does not allow: cancelling
         // one already cancelled, storno on a draft. Retrying sends the same thing again.
-        400 or 409 or 422 => SefFailureKind.CallerMistake,
+        // 404 is a wrong id: the invoice SEF was asked about does not exist, and asking again
+        // for the same one is asking the same question.
+        400 or 404 or 409 or 422 => SefFailureKind.CallerMistake,
 
         408 or 429 or >= 500 => SefFailureKind.Transient,
 
@@ -178,6 +180,7 @@ public sealed class SefResult<T>
     /// Reserved for state-changing sends. Everything a host does about it — reconciling by
     /// requestId, refusing to resend — hangs off this one distinction.
     /// </summary>
-    public static SefResult<T> Unknown(string message) =>
-        new(SefOutcome.Unknown, default, null, message, null, null);
+    public static SefResult<T> Unknown(
+        string message, int? httpStatusCode = null, string? responseBody = null) =>
+        new(SefOutcome.Unknown, default, null, message, httpStatusCode, responseBody);
 }

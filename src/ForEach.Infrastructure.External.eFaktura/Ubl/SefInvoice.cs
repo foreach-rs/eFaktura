@@ -3,11 +3,11 @@ namespace ForEach.Infrastructure.External.eFaktura.Ubl;
 /// <summary>
 /// Which document this is.
 ///
-/// Three of these five are shapes the writer can produce. The other two —
-/// <see cref="DebitNote"/> and the advance pair — exist so a host can hand one over and be refused
-/// *by name* rather than have it filed as something else. See the writer for why that refusal is
-/// deliberate: a document the tax authority accepts and records as the wrong kind is worse than
-/// one it rejects.
+/// The writer produces all five. An invoice and a credit note are separate UBL roots; a debit
+/// note is an Invoice document with type code 383, an advance invoice carries 386, and a final
+/// invoice is a 380 that deducts advances. What the writer refuses is a correction that names no
+/// original, and a deduction that does not add up — a document the tax authority accepts and
+/// records as the wrong kind is worse than one it rejects.
 /// </summary>
 public enum SefInvoiceType
 {
@@ -15,7 +15,7 @@ public enum SefInvoiceType
     Invoice,
     /// <summary>A credit note: reduces what an earlier invoice asked for.</summary>
     CreditNote,
-    /// <summary>A debit note. Refused by the writer, by name.</summary>
+    /// <summary>A debit note: an Invoice document with type code 383, naming the invoice it corrects.</summary>
     DebitNote,
 
     /// <summary>
@@ -29,8 +29,8 @@ public enum SefInvoiceType
     /// deduction that makes it a shape of its own — filed as a plain invoice it would declare the
     /// full supply and take nothing back, so the tax on the advance would be paid twice.
     ///
-    /// UBL expresses the deduction as <c>cac:PrepaidPayment</c>, and the payable amount falls by
-    /// it. The advances themselves are named in <c>cac:BillingReference</c>, which is what lets
+    /// The writer states the deduction as <c>cbc:PrepaidAmount</c> in
+    /// <c>cac:LegalMonetaryTotal</c>, and the payable amount falls by it. The advances themselves are named in <c>cac:BillingReference</c>, which is what lets
     /// the authority match the deduction to declarations it already holds.
     /// </summary>
     FinalInvoice
