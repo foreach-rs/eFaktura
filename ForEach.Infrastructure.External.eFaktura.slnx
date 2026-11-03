@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ForEach.Infrastructure.External.eFaktura/ForEach.Infrastructure.External.eFaktura.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ForEach.Infrastructure.External.eFaktura.UnitTests/ForEach.Infrastructure.External.eFaktura.UnitTests.csproj" />
+  </Folder>
+</Solution>
