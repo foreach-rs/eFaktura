@@ -1,3 +1,5 @@
+> This repository is archived. Development continues in the For-Each package monorepo; version 0.1.0 remains available on nuget.org.
+
 # ForEach.Infrastructure.External.eFaktura
 
 Client and UBL 2.1 invoice writer and reader for the Serbian e-invoicing system (SEF, Sistem e-Faktura). Targets net8.0 and net10.0, no dependencies beyond the framework. The
